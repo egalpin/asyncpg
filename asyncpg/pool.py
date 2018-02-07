@@ -282,6 +282,7 @@ class PoolConnectionHolder:
             if self._consecutive_exceptions > self._max_consecutive_exceptions:
                 await self.close()
                 self._consecutive_exceptions = 0
+                self._pool._working_addr = None
 
 
 class Pool:
