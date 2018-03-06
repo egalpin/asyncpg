@@ -299,7 +299,7 @@ class Pool:
     __slots__ = ('_queue', '_loop', '_minsize', '_maxsize',
                  '_working_addr', '_working_config', '_working_params',
                  '_holders', '_initialized', '_closed',
-                 '_connection_class')
+                 '_connection_class', '_max_pre_connect')
 
     def __init__(self, *connect_args,
                  min_size,
@@ -311,6 +311,7 @@ class Pool:
                  loop,
                  connection_class,
                  max_consecutive_exceptions,
+                 max_pre_connect,
                  **connect_kwargs):
 
         if loop is None:
@@ -349,6 +350,7 @@ class Pool:
         self._connection_class = connection_class
 
         self._closed = False
+        self._max_pre_connect = max_pre_connect
 
         for _ in range(max_size):
             ch = PoolConnectionHolder(
@@ -386,8 +388,10 @@ class Pool:
                 connect_tasks = []
                 for i, ch in enumerate(reversed(self._holders[:-1])):
                     # `minsize - 1` because we already have first_ch
-                    if i >= self._minsize - 1:
+                    if i >= self._minsize - 1 or \
+                            i >= self._max_pre_connect - 1:
                         break
+
                     connect_tasks.append(ch.connect())
 
                 await asyncio.gather(*connect_tasks, loop=self._loop)
@@ -626,6 +630,7 @@ def create_pool(dsn=None, *,
                 max_queries=50000,
                 max_inactive_connection_lifetime=300.0,
                 max_consecutive_exceptions=0,
+                max_pre_connect=0,
                 setup=None,
                 init=None,
                 loop=None,
@@ -691,6 +696,11 @@ def create_pool(dsn=None, *,
         pointing to an old DB after a failover) and will therefore be closed.
         Pass ``0`` to disable.
 
+    :param int max_pre_connect:
+        the maximum number of connections to pre-connect at the time of pool
+        creation. Pass ``0`` to default to pre-connecting all connections
+        in the pool.
+
     :param coroutine setup:
         A coroutine to prepare a connection right before it is returned
         from :meth:`Pool.acquire() <pool.Pool.acquire>`.  An example use
@@ -733,6 +743,9 @@ def create_pool(dsn=None, *,
             'connection_class is expected to be a subclass of '
             'asyncpg.Connection, got {!r}'.format(connection_class))
 
+    if not max_pre_connect == 0:
+        max_pre_connect = max_size
+
     return Pool(
         dsn,
         connection_class=connection_class,
@@ -740,4 +753,5 @@ def create_pool(dsn=None, *,
         max_queries=max_queries, loop=loop, setup=setup, init=init,
         max_inactive_connection_lifetime=max_inactive_connection_lifetime,
         max_consecutive_exceptions=max_consecutive_exceptions,
+        max_pre_connect=max_pre_connect,
         **connect_kwargs)
