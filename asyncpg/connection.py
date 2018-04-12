@@ -1343,15 +1343,22 @@ class Connection(metaclass=ConnectionMeta):
         return result
 
     async def _do_execute(self, query, executor, timeout, retry=True):
-        if timeout is None:
-            stmt = await self._get_statement(query, None)
+        # Go directly to cache, don't `await` unless we need to prep a stmt
+        stmt = self._stmt_cache.get(query)
+
+        if stmt:
+            before = after = time.monotonic()
         else:
-            before = time.monotonic()
-            stmt, cache_get_time, prep_time, cache_put_time, cleanup_time = \
-                await self._get_statement(query, timeout, with_timers=True)
-            after = time.monotonic()
-            timeout -= after - before
-            before = after
+            if timeout is None:
+                stmt = await self._get_statement(query, None)
+            else:
+                before = time.monotonic()
+                stmt, cache_get_time, prep_time, cache_put_time, \
+                    cleanup_time = await self._get_statement(query, timeout,
+                                                             with_timers=True)
+                after = time.monotonic()
+                timeout -= after - before
+                before = after
 
         try:
             if timeout is None:
