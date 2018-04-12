@@ -265,10 +265,19 @@ class Connection(metaclass=ConnectionMeta):
         return await self._executemany(command, args, timeout)
 
     async def _get_statement(self, query, timeout, *, named: bool=False,
-                             use_cache: bool=True):
+                             use_cache: bool=True, with_timers: bool=False):
+        before_prep, after_prep, before_cleanup, after_cleanup, \
+            before_cache_get, after_cache_get, before_cache_put, \
+            after_cache_put = [-1] * 8
         if use_cache:
+            before_cache_get = time.monotonic()
             statement = self._stmt_cache.get(query)
+            after_cache_get = time.monotonic()
             if statement is not None:
+                if with_timers:
+                    result = [statement, after_cache_get - before_cache_get]
+                    result.extend([-1] * 3)
+                    return result
                 return statement
 
             # Only use the cache when:
@@ -285,7 +294,9 @@ class Connection(metaclass=ConnectionMeta):
         else:
             stmt_name = ''
 
+        before_prep = time.monotonic()
         statement = await self._protocol.prepare(stmt_name, query, timeout)
+        after_prep = time.monotonic()
         ready = statement._init_types()
         if ready is not True:
             types, intro_stmt = await self.__execute(
@@ -307,12 +318,25 @@ class Connection(metaclass=ConnectionMeta):
                 stmt_name, query, timeout, state=statement)
 
         if use_cache:
+            before_cache_put = time.monotonic()
             self._stmt_cache.put(query, statement)
+            after_cache_put = time.monotonic()
 
         # If we've just created a new statement object, check if there
         # are any statements for GC.
         if self._stmts_to_close:
+            before_cleanup = time.monotonic()
             await self._cleanup_stmts()
+            after_cleanup = time.monotonic()
+
+        if with_timers:
+            return (
+                statement,
+                after_cache_get - before_cache_get,
+                after_prep - before_prep,
+                after_cache_put - before_cache_put,
+                after_cleanup - before_cleanup,
+            )
 
         return statement
 
@@ -1323,7 +1347,8 @@ class Connection(metaclass=ConnectionMeta):
             stmt = await self._get_statement(query, None)
         else:
             before = time.monotonic()
-            stmt = await self._get_statement(query, timeout)
+            stmt, cache_get_time, prep_time, cache_put_time, cleanup_time = \
+                await self._get_statement(query, timeout, with_timers=True)
             after = time.monotonic()
             timeout -= after - before
             before = after
