@@ -7,9 +7,11 @@
 
 import asyncio
 from concurrent.futures._base import TimeoutError
+from concurrent.futures import FIRST_COMPLETED
 import functools
 import inspect
 import time
+from typing import Callable
 
 from . import connection
 from . import connect_utils
@@ -394,7 +396,8 @@ class Pool:
         self._initialized = True
         return self
 
-    async def execute(self, query: str, *args, timeout: float=None) -> str:
+    async def execute(self, query: str, *args, timeout: float=None,
+                      speculative: bool=False, spec_attempts: int=3) -> str:
         """Execute an SQL command (or commands).
 
         Pool performs this operation using one of its connections.  Other than
@@ -403,10 +406,17 @@ class Pool:
 
         .. versionadded:: 0.10.0
         """
-        async with self.acquire() as con:
-            return await con.execute(query, *args, timeout=timeout)
+        async def _execute():
+            async with self.acquire() as con:
+                return await con.execute(query, *args, timeout=timeout)
 
-    async def executemany(self, command: str, args, *, timeout: float=None):
+        if speculative:
+            return await self._speculative_call(command=_execute,
+                                                attemps=spec_attempts)
+        return await _execute()
+
+    async def executemany(self, command: str, args, *, timeout: float=None,
+                          speculative: bool=False, spec_attempts: int=3):
         """Execute an SQL *command* for each sequence of arguments in *args*.
 
         Pool performs this operation using one of its connections.  Other than
@@ -415,10 +425,17 @@ class Pool:
 
         .. versionadded:: 0.10.0
         """
-        async with self.acquire() as con:
-            return await con.executemany(command, args, timeout=timeout)
+        async def _executemany():
+            async with self.acquire() as con:
+                return await con.executemany(command, args, timeout=timeout)
 
-    async def fetch(self, query, *args, timeout=None) -> list:
+        if speculative:
+            return await self._speculative_call(command=_executemany,
+                                                attempts=spec_attempts)
+        return await _executemany()
+
+    async def fetch(self, query, *args, timeout=None, speculative: bool=False,
+                    spec_attempts: int=3) -> list:
         """Run a query and return the results as a list of :class:`Record`.
 
         Pool performs this operation using one of its connections.  Other than
@@ -427,10 +444,17 @@ class Pool:
 
         .. versionadded:: 0.10.0
         """
-        async with self.acquire() as con:
-            return await con.fetch(query, *args, timeout=timeout)
+        async def _fetch():
+            async with self.acquire() as con:
+                return await con.fetch(query, *args, timeout=timeout)
 
-    async def fetchval(self, query, *args, column=0, timeout=None):
+        if speculative:
+            return await self._speculative_call(command=_fetch,
+                                                attempts=spec_attempts)
+        return await _fetch()
+
+    async def fetchval(self, query, *args, column=0, timeout=None,
+                       speculative: bool=False, spec_attempts: int=3):
         """Run a query and return a value in the first row.
 
         Pool performs this operation using one of its connections.  Other than
@@ -439,11 +463,18 @@ class Pool:
 
         .. versionadded:: 0.10.0
         """
-        async with self.acquire() as con:
-            return await con.fetchval(
-                query, *args, column=column, timeout=timeout)
+        async def _fetchval():
+            async with self.acquire() as con:
+                return await con.fetchval(
+                    query, *args, column=column, timeout=timeout)
 
-    async def fetchrow(self, query, *args, timeout=None):
+        if speculative:
+            return await self._speculative_call(command=_fetchval,
+                                                attempts=spec_attempts)
+        return await _fetchval()
+
+    async def fetchrow(self, query, *args, timeout=None,
+                       speculative: bool=False, spec_attempts: int=3):
         """Run a query and return the first row.
 
         Pool performs this operation using one of its connections.  Other than
@@ -452,8 +483,14 @@ class Pool:
 
         .. versionadded:: 0.10.0
         """
-        async with self.acquire() as con:
-            return await con.fetchrow(query, *args, timeout=timeout)
+        async def _fetchrow():
+            async with self.acquire() as con:
+                return await con.fetchrow(query, *args, timeout=timeout)
+
+        if speculative:
+            return await self._speculative_call(command=_fetchrow,
+                                                attempts=spec_attempts)
+        return await _fetchrow()
 
     def acquire(self, *, timeout=None):
         """Acquire a database connection from the pool.
@@ -585,6 +622,46 @@ class Pool:
 
     async def __aexit__(self, *exc):
         await self.close()
+
+    async def _speculative_call(self, *, command: Callable, attempts: int):
+        timeout = self._holders[-1]._connect_kwargs.get('command_timeout')
+        if timeout is None:
+            # Essentially voids the whole benefit of sepculative requests, but
+            # will prevent breakage i.e. emulates just call 'execute', for
+            # example.
+            attempts = 1
+            per_call_timeout = None
+        else:
+            per_call_timeout = timeout / attempts
+
+        futures = []
+        for _ in range(attempts):
+            fut = command()
+            futures.append(fut)
+            done, pending = await asyncio.wait(futures,
+                                               timeout=per_call_timeout,
+                                               return_when=FIRST_COMPLETED)
+
+            if len(done) == attempts:
+                # All attempts are completed
+                pass
+
+            exceptions = set()
+            for f in done:
+                result = f.result()
+                if isinstance(asyncio.TimeoutError):
+                    # TODO do something with exceptions
+                    pass
+                elif isinstance(result, Exception):
+                    # TODO do something with exceptions
+                    exceptions.add(result)
+                else:
+                    # We have a real query result, cancel any pending attempts
+                    for f in pending:
+                        f.cancel()
+                    print(exceptions)
+                    return result
+            print(exceptions)
 
 
 class PoolAcquireContext:
